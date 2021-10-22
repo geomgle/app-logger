@@ -10,6 +10,7 @@ use bollard::{
     Docker,
 };
 use bytes::BytesMut;
+use color_eyre::eyre::{Result, WrapErr};
 use futures::stream::{Stream, StreamExt};
 use futures_util::{TryFutureExt, TryStreamExt};
 use hyper::{
@@ -24,33 +25,51 @@ use hyper::{
 use tokio::{fs::File, process::Command};
 use tokio_util::codec::{BytesCodec, FramedRead};
 
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    let docker = connect_docker();
-    let mut stream = get_log_stream(&docker);
-    while let Some(log) = stream.next().await {
-        println!("{:#?}", log.unwrap().into_bytes());
-    }
-    Ok(())
+    color_eyre::install();
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8000));
+    let make_svc = make_service_fn(|_conn| async {
+        Ok::<_, Infallible>(service_fn(handle_request))
+    });
+    let server = Server::bind(&addr).serve(make_svc);
+    println!("app log is running at: 3000");
+    Ok(server.await.wrap_err("failed to running server")?)
 }
 
 pub fn connect_docker() -> Result<Docker> {
-    Ok(Docker::connect_with_socket_defaults().map_err(|e| {
-        eprintln!("failed to connect docker socket: {:#?}", e);
-        e
-    })?)
+    Docker::connect_with_socket_defaults()
+        .wrap_err("failed to connect docker socket")
 }
 
 fn get_log_stream(
     docker: &Docker,
-) -> impl Stream<Item = std::result::Result<LogOutput, bollard::errors::Error>>
-{
+) -> impl Stream<Item = Result<bytes::Bytes, bollard::errors::Error>> {
     let options = Some(LogsOptions::<String> {
         stdout: true,
         ..Default::default()
     });
 
-    docker.logs("app", options)
+    docker.logs("app", options).map(|log| log.map(|output| output.into_bytes()))
+}
+
+async fn handle_request(req: Request<Body>) -> Result<Response<Body>> {
+    match (req.method(), req.uri().path()) {
+        // Stream a file from a disk
+        (&Method::GET, "/logs") => {
+            let docker = connect_docker()?;
+            let stream = get_log_stream(&docker);
+            let s = Body::wrap_stream(stream);
+            let response = Response::new(s);
+            return Ok(response);
+        }
+
+        // 404 not found
+        _ => {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = StatusCode::NOT_FOUND;
+            return Ok(response);
+        }
+    };
 }
